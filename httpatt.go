@@ -8,12 +8,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	//"encoding/pem"
 	"fmt"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,28 +23,35 @@ import (
 	"time"
 )
 
-// 配置规则结构体
 type PathRule struct {
-	Scheme   string // 协议（http/https）
-	Host     string // 域名
-	Path     string // URL路径
-	FilePath string // 文件路径
+	Scheme   string
+	Host     string
+	Path     string
+	FilePath string
+}
+
+// 新增代理规则结构体
+type ProxyRule struct {
+	Type   string // "host" 或 "url"
+	Match  string // 匹配内容
+	Target string // 目标地址
 }
 
 type Config struct {
-	Hosts     map[string]struct{}
-	PathRules []PathRule
-	caCert    *x509.Certificate
-	caPrivKey *ecdsa.PrivateKey
-	certCache sync.Map
+	Hosts       map[string]struct{}
+	PathRules   []PathRule
+	ProxyRules  []ProxyRule // 新增代理规则
+	caCert      *x509.Certificate
+	caPrivKey   *ecdsa.PrivateKey
+	certCache   sync.Map
 }
 
 var config = &Config{
-	Hosts:   make(map[string]struct{}),
-	PathRules: make([]PathRule, 0),
+	Hosts:      make(map[string]struct{}),
+	PathRules:  make([]PathRule, 0),
+	ProxyRules: make([]ProxyRule, 0), // 初始化代理规则
 }
 
-// 生成根证书
 func generateRootCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	caPrivKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -72,7 +79,6 @@ func generateRootCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	return caCert, caPrivKey, err
 }
 
-// 生成域名证书
 func generateDomainCert(domain string, caCert *x509.Certificate, caPrivKey *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -95,17 +101,19 @@ func generateDomainCert(domain string, caCert *x509.Certificate, caPrivKey *ecds
 }
 
 func initConfig() error {
-	// 读取hosts文件
 	if err := parseHosts("/dksoft/conf/hosts"); err != nil {
 		return err
 	}
 
-	// 读取url.cfg文件
 	if err := parseUrlConfig("/dksoft/conf/url.cfg"); err != nil {
 		return err
 	}
 
-	// 生成根证书
+	// 新增代理配置解析
+	if err := parseProxyConfig("/dksoft/conf/proxy.cfg"); err != nil {
+		return err
+	}
+
 	caCert, caPrivKey, err := generateRootCA()
 	if err != nil {
 		return fmt.Errorf("生成CA证书失败: %v", err)
@@ -113,7 +121,6 @@ func initConfig() error {
 	config.caCert = caCert
 	config.caPrivKey = caPrivKey
 
-	// 排序规则：特定域名优先，路径长的优先
 	sort.Slice(config.PathRules, func(i, j int) bool {
 		if config.PathRules[i].Host != "" && config.PathRules[j].Host == "" {
 			return true
@@ -121,6 +128,44 @@ func initConfig() error {
 		return len(config.PathRules[i].Path) > len(config.PathRules[j].Path)
 	})
 
+	return nil
+}
+
+// 新增代理配置文件解析
+func parseProxyConfig(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 文件不存在不报错
+		}
+		return fmt.Errorf("无法打开proxy.cfg文件: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) < 3 {
+			continue
+		}
+
+		ruleType := strings.TrimSuffix(parts[0], ":")
+		match := parts[1]
+		target := parts[2]
+
+		if strings.ToLower(ruleType) == "host" || strings.ToLower(ruleType) == "url" {
+			config.ProxyRules = append(config.ProxyRules, ProxyRule{
+				Type:   strings.ToLower(ruleType),
+				Match:  match,
+				Target: target,
+			})
+		}
+	}
 	return nil
 }
 
@@ -177,7 +222,6 @@ func parseUrlConfig(path string) error {
 		rawPattern := strings.TrimSpace(parts[0])
 		filePath := strings.TrimSpace(parts[1])
 
-		// 解析URL模式
 		var rule PathRule
 		if u, err := url.Parse(rawPattern); err == nil {
 			rule.Scheme = u.Scheme
@@ -190,7 +234,6 @@ func parseUrlConfig(path string) error {
 			rule.Path = rawPattern
 		}
 
-		// 处理文件路径
 		if strings.Contains(filePath, "dkay-scripts") {
 			rule.FilePath = filepath.Join("/dksoft/html", filePath)
 		} else {
@@ -220,23 +263,61 @@ func getCert(domain string) (*tls.Certificate, error) {
 	return tlsCert, nil
 }
 
+// 新增反向代理处理
+func handleProxy(target string, w http.ResponseWriter, r *http.Request) {
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = target
+			req.Host = target // 保持Host头一致
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			log.Printf("[%s]%s --- 代理到 %s (状态码: %d)", 
+				r.Host, r.URL.Path, target, resp.StatusCode)
+			return nil
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// 检查白名单
 	if _, ok := config.Hosts[r.Host]; !ok {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprintf(w, "503 Service Unavailable")
 		return
 	}
 
-	// 遍历规则寻找匹配项
+	// 优先处理代理规则
+	var proxyTarget string
+	// 先检查host类型规则
+	for _, rule := range config.ProxyRules {
+		if rule.Type == "host" && rule.Match == r.Host {
+			proxyTarget = rule.Target
+			break
+		}
+	}
+	// 如果没有host匹配，检查url类型规则
+	if proxyTarget == "" {
+		for _, rule := range config.ProxyRules {
+			if rule.Type == "url" && strings.Contains(r.URL.Path, rule.Match) {
+				proxyTarget = rule.Target
+				break
+			}
+		}
+	}
+
+	if proxyTarget != "" {
+		handleProxy(proxyTarget, w, r)
+		return
+	}
+
+	// 原始文件服务逻辑
 	var targetFile string
 	for _, rule := range config.PathRules {
-		// 匹配域名
 		if rule.Host != "" && rule.Host != r.Host {
 			continue
 		}
 
-		// 精确匹配路径
 		if r.URL.Path == rule.Path {
 			targetFile = rule.FilePath
 			break
@@ -248,19 +329,16 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 读取文件
 	content, err := os.ReadFile(targetFile)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	// 返回响应
 	w.Header().Set("Content-Type", getContentType(targetFile))
 	w.WriteHeader(http.StatusOK)
 	w.Write(content)
-	
-	log.Printf("[%s]%s --- 成功返回", r.Host, r.URL.Path)
+	log.Printf("[%s]%s --- 文件响应", r.Host, r.URL.Path)
 }
 
 func getContentType(filename string) string {
@@ -299,6 +377,11 @@ func startServer(port string, tlsConf *tls.Config) {
 func main() {
 	if err := initConfig(); err != nil {
 		log.Fatal("配置初始化失败: ", err)
+	}
+
+	log.Println("加载的代理规则:")
+	for _, rule := range config.ProxyRules {
+		log.Printf("%s规则 [%s] => %s", rule.Type, rule.Match, rule.Target)
 	}
 
 	log.Println("加载的URL映射规则:")
